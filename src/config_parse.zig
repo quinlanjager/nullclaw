@@ -826,6 +826,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             if (hb.object.get("prompt")) |v| {
                                 if (v == .string) self.heartbeat.prompt = v.string;
                             }
+                            if (hb.object.get("thinking_on_idle")) |v| {
+                                if (v == .bool) self.heartbeat.thinking_on_idle = v.bool;
+                            }
+                            if (hb.object.get("thinking_prompt")) |v| {
+                                if (v == .string) self.heartbeat.thinking_prompt = v.string;
+                            }
                             if (hb.object.get("model")) |v| {
                                 if (v == .string) self.heartbeat.model = v.string;
                             }

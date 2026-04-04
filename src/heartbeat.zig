@@ -9,6 +9,7 @@ const MAX_HEARTBEAT_FILE_BYTES: usize = 64 * 1024;
 
 pub const TickOutcome = enum {
     processed,
+    thinking,
     skipped_empty_file,
     skipped_missing_file,
 };
@@ -24,6 +25,7 @@ pub const HeartbeatEngine = struct {
     interval_minutes: u32,
     workspace_dir: []const u8,
     observer: ?observability.Observer,
+    thinking_on_idle: bool = false,
     bootstrap_provider: ?BootstrapProvider = null,
 
     pub fn init(enabled: bool, interval_minutes: u32, workspace_dir: []const u8, observer: ?observability.Observer) HeartbeatEngine {
@@ -140,6 +142,10 @@ pub const HeartbeatEngine = struct {
             if (bp_content) |content| {
                 defer allocator.free(content);
                 if (isContentEffectivelyEmpty(content)) {
+                    if (self.thinking_on_idle) {
+                        log.info("heartbeat tick entering thinking mode: file empty", .{});
+                        return .{ .outcome = .thinking, .task_count = 0 };
+                    }
                     log.info("heartbeat tick skipped: file empty", .{});
                     return .{ .outcome = .skipped_empty_file, .task_count = 0 };
                 }
@@ -147,6 +153,10 @@ pub const HeartbeatEngine = struct {
                 defer freeTasks(allocator, tasks);
                 log.info("heartbeat tick processed: {d} task(s) dispatched", .{tasks.len});
                 return .{ .outcome = .processed, .task_count = tasks.len };
+            }
+            if (self.thinking_on_idle) {
+                log.info("heartbeat tick entering thinking mode: file missing", .{});
+                return .{ .outcome = .thinking, .task_count = 0 };
             }
             log.info("heartbeat tick skipped: file missing", .{});
             return .{ .outcome = .skipped_missing_file, .task_count = 0 };
@@ -158,6 +168,10 @@ pub const HeartbeatEngine = struct {
 
         const file = std.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {
+                if (self.thinking_on_idle) {
+                    log.info("heartbeat tick entering thinking mode: file missing", .{});
+                    return .{ .outcome = .thinking, .task_count = 0 };
+                }
                 log.info("heartbeat tick skipped: file missing", .{});
                 return .{ .outcome = .skipped_missing_file, .task_count = 0 };
             },
@@ -168,6 +182,10 @@ pub const HeartbeatEngine = struct {
         const content = try file.readToEndAlloc(allocator, MAX_HEARTBEAT_FILE_BYTES);
         defer allocator.free(content);
         if (isContentEffectivelyEmpty(content)) {
+            if (self.thinking_on_idle) {
+                log.info("heartbeat tick entering thinking mode: file empty", .{});
+                return .{ .outcome = .thinking, .task_count = 0 };
+            }
             log.info("heartbeat tick skipped: file empty", .{});
             return .{ .outcome = .skipped_empty_file, .task_count = 0 };
         }
@@ -337,4 +355,42 @@ test "isContentEffectivelyEmpty mirrors OpenClaw file gating semantics" {
     try std.testing.expect(HeartbeatEngine.isContentEffectivelyEmpty("## Tasks\n- [ ]\n+ [x]\n* [X]"));
     try std.testing.expect(!HeartbeatEngine.isContentEffectivelyEmpty("Check status"));
     try std.testing.expect(!HeartbeatEngine.isContentEffectivelyEmpty("#TODO keep this"));
+}
+
+test "tick returns thinking when file missing and thinking_on_idle enabled" {
+    const allocator = std.testing.allocator;
+    var engine = HeartbeatEngine.init(true, 1, "/nonexistent/path/for/test", null);
+    engine.thinking_on_idle = true;
+    const result = try engine.tick(allocator);
+    try std.testing.expectEqual(TickOutcome.thinking, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), result.task_count);
+}
+
+test "tick returns skipped_missing_file when thinking_on_idle disabled" {
+    const allocator = std.testing.allocator;
+    var engine = HeartbeatEngine.init(true, 1, "/nonexistent/path/for/test", null);
+    engine.thinking_on_idle = false;
+    const result = try engine.tick(allocator);
+    try std.testing.expectEqual(TickOutcome.skipped_missing_file, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), result.task_count);
+}
+
+test "tick returns thinking when file empty and thinking_on_idle enabled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write a header-only HEARTBEAT.md (effectively empty)
+    const file = try tmp.dir.createFile("HEARTBEAT.md", .{});
+    try file.writeAll("# Periodic Tasks\n\n");
+    file.close();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var engine = HeartbeatEngine.init(true, 1, tmp_path, null);
+    engine.thinking_on_idle = true;
+    const result = try engine.tick(allocator);
+    try std.testing.expectEqual(TickOutcome.thinking, result.outcome);
+    try std.testing.expectEqual(@as(usize, 0), result.task_count);
 }

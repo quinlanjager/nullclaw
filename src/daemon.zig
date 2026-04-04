@@ -43,6 +43,12 @@ const DEFAULT_HEARTBEAT_PROMPT =
     "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. " ++
     "Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
 
+const DEFAULT_THINKING_PROMPT =
+    "No HEARTBEAT.md file is present. You are in autonomous thinking mode. " ++
+    "Review any background tasks or context you have access to. " ++
+    "If there is nothing to report, reply HEARTBEAT_OK. " ++
+    "Otherwise, summarize what needs attention.";
+
 /// Daemon heartbeat initializes memory/bootstrap runtime state before it
 /// settles into its periodic loop, so it needs the session-turn budget.
 const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE;
@@ -218,6 +224,7 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
         config.workspace_dir,
         null,
     );
+    heartbeat_engine.thinking_on_idle = config.heartbeat.thinking_on_idle;
     heartbeat_engine.bootstrap_provider = bootstrap_mod.createProvider(
         allocator,
         config.memory.backend,
@@ -257,6 +264,31 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                         defer allocator.free(result.output);
                         log.info("heartbeat agent completed (success={}, output_len={})", .{ result.success, result.output.len });
                         // Deliver result if configured
+                        if (config.heartbeat.delivery_mode) |dm| {
+                            const delivery = cron.DeliveryConfig{
+                                .mode = cron.DeliveryMode.parse(dm),
+                                .channel = config.heartbeat.delivery_channel,
+                                .to = config.heartbeat.delivery_to,
+                                .account_id = config.heartbeat.delivery_account_id,
+                            };
+                            _ = cron.deliverResult(allocator, delivery, result.output, result.success, event_bus) catch {};
+                        }
+                    }
+                },
+                .thinking => {
+                    log.info("heartbeat tick entering thinking mode", .{});
+                    if (builtin.is_test) {
+                        log.info("heartbeat: test mode, skipping thinking dispatch", .{});
+                    } else {
+                        const prompt = config.heartbeat.thinking_prompt orelse DEFAULT_THINKING_PROMPT;
+                        const result = agent_runner.run(allocator, config.workspace_dir, prompt, config.heartbeat.model, config.heartbeat.timeout_secs) catch |err| {
+                            log.warn("thinking agent dispatch failed: {s}", .{@errorName(err)});
+                            next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+                            std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                            continue;
+                        };
+                        defer allocator.free(result.output);
+                        log.info("thinking agent completed (success={}, output_len={})", .{ result.success, result.output.len });
                         if (config.heartbeat.delivery_mode) |dm| {
                             const delivery = cron.DeliveryConfig{
                                 .mode = cron.DeliveryMode.parse(dm),
