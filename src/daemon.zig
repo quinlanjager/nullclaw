@@ -923,27 +923,51 @@ fn nextOutboundDraftId() u64 {
 }
 
 fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
-    if (event.stage != .chunk or event.text.len == 0) return;
     const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
 
-    const out = if (ctx.account_id) |aid|
-        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, event.text)
-    else
-        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, event.text);
+    switch (event.stage) {
+        .intermediate => {
+            if (event.text.len == 0) return;
+            // Intermediate iteration text: standalone message, no draft tracking.
+            const out = if (ctx.account_id) |aid|
+                bus_mod.makeOutboundIntermediateWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, event.text)
+            else
+                bus_mod.makeOutboundIntermediate(ctx.allocator, ctx.channel, ctx.chat_id, event.text);
 
-    var message = out catch |err| {
-        log.warn("inbound dispatch chunk makeOutbound failed: {}", .{err});
-        return;
-    };
-    message.draft_id = ctx.draft_id;
-    ctx.event_bus.publishOutbound(message) catch |err| {
-        message.deinit(ctx.allocator);
-        if (err != error.Closed) {
-            log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
-        }
-        return;
-    };
-    ctx.emitted_chunk = true;
+            var message = out catch |err| {
+                log.warn("inbound dispatch intermediate makeOutbound failed: {}", .{err});
+                return;
+            };
+            ctx.event_bus.publishOutbound(message) catch |err| {
+                message.deinit(ctx.allocator);
+                if (err != error.Closed) {
+                    log.warn("inbound dispatch intermediate publishOutbound failed: {}", .{err});
+                }
+            };
+        },
+        .chunk => {
+            if (event.text.len == 0) return;
+            const out = if (ctx.account_id) |aid|
+                bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, event.text)
+            else
+                bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, event.text);
+
+            var message = out catch |err| {
+                log.warn("inbound dispatch chunk makeOutbound failed: {}", .{err});
+                return;
+            };
+            message.draft_id = ctx.draft_id;
+            ctx.event_bus.publishOutbound(message) catch |err| {
+                message.deinit(ctx.allocator);
+                if (err != error.Closed) {
+                    log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
+                }
+                return;
+            };
+            ctx.emitted_chunk = true;
+        },
+        .final => {},
+    }
 }
 
 fn makeAssistantReplyOutbound(
@@ -1062,11 +1086,14 @@ fn inboundDispatcherThread(
         };
         var stream_sink: ?streaming.Sink = null;
         var outbound_tag_filter: streaming.TagFilter = undefined;
+        // Raw sink for intermediate iteration messages (bypasses tag filter).
+        // Always available when there is an outbound channel, regardless of streaming mode.
+        const raw_sink = streaming.Sink{
+            .callback = publishStreamingChunk,
+            .ctx = @ptrCast(&streaming_ctx),
+        };
+        const iteration_sink: ?streaming.Sink = if (outbound_channel != null) raw_sink else null;
         if (use_streaming_outbound) {
-            const raw_sink = streaming.Sink{
-                .callback = publishStreamingChunk,
-                .ctx = @ptrCast(&streaming_ctx),
-            };
             stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
         }
 
@@ -1082,6 +1109,7 @@ fn inboundDispatcherThread(
             msg.content,
             conversation_context,
             stream_sink,
+            iteration_sink,
         ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
@@ -1408,6 +1436,7 @@ test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
                     @memcpy(self.buf[self.len..][0..event.text.len], event.text);
                     self.len += event.text.len;
                 },
+                .intermediate => {},
                 .final => self.got_final = true,
             }
         }

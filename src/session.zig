@@ -1504,7 +1504,7 @@ pub const SessionManager = struct {
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
-        return self.processMessageStreaming(session_key, content, conversation_context, null);
+        return self.processMessageStreaming(session_key, content, conversation_context, null, null);
     }
 
     /// Process a message within a session context and optionally forward text deltas.
@@ -1515,6 +1515,7 @@ pub const SessionManager = struct {
         content: []const u8,
         conversation_context: ?ConversationContext,
         stream_sink: ?streaming.Sink,
+        iteration_sink: ?streaming.Sink,
     ) ![]const u8 {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
@@ -1570,9 +1571,11 @@ pub const SessionManager = struct {
 
         const prev_stream_callback = session.agent.stream_callback;
         const prev_stream_ctx = session.agent.stream_ctx;
+        const prev_iteration_sink = session.agent.iteration_sink;
         defer {
             session.agent.stream_callback = prev_stream_callback;
             session.agent.stream_ctx = prev_stream_ctx;
+            session.agent.iteration_sink = prev_iteration_sink;
         }
 
         var stream_adapter: StreamAdapterCtx = undefined;
@@ -1584,6 +1587,7 @@ pub const SessionManager = struct {
             session.agent.stream_callback = null;
             session.agent.stream_ctx = null;
         }
+        session.agent.iteration_sink = iteration_sink;
 
         const turn_input = agent_mod.commands.planTurnInput(content);
         const response = try session.agent.turn(content);
@@ -3294,6 +3298,7 @@ test "processMessageStreaming forwards provider deltas" {
             .callback = DeltaCollector.onEvent,
             .ctx = @ptrCast(&collector),
         },
+        null,
     );
     defer testing.allocator.free(resp);
 

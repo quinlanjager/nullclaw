@@ -516,6 +516,9 @@ pub const SseStreamCtx = struct {
             .chunk => {
                 if (event.text.len > 0) self.emitChunkEvent(event.text);
             },
+            .intermediate => {
+                if (event.text.len > 0) self.emitChunkEvent(event.text);
+            },
             .final => {}, // Final event is handled after processMessageStreaming returns.
         }
     }
@@ -605,7 +608,7 @@ pub fn handleStreamingRpc(
     const sink = sse_ctx.makeSink();
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processMessageStreaming(task.session_key, text, context, sink) catch |err| {
+    const response = session_mgr.processMessageStreaming(task.session_key, text, context, sink, null) catch |err| {
         log.err("streaming turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         var failed_task = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         defer if (failed_task) |*snapshot| snapshot.deinit(allocator);
@@ -1508,7 +1511,7 @@ const MockSessionManager = struct {
         return self.allocator.dupe(u8, self.response);
     }
 
-    pub fn processMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink) ![]const u8 {
+    pub fn processMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink, _: ?streaming.Sink) ![]const u8 {
         // Emit chunks if a sink is provided.
         if (sink) |s| {
             s.emitChunk(self.response);

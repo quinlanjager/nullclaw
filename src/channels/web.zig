@@ -1283,6 +1283,7 @@ pub const WebChannel = struct {
 
         const event_type = switch (stage) {
             .chunk => "assistant_chunk",
+            .intermediate => "assistant_intermediate",
             .final => "assistant_final",
         };
 

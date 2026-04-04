@@ -26,6 +26,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const streaming = @import("../streaming.zig");
 const verbose_mod = @import("../verbose.zig");
 
 const cache = memory_mod.cache;
@@ -331,6 +332,9 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Optional sink for emitting intermediate iteration text (complete turn text sent
+    /// as standalone messages rather than token-by-token streaming chunks).
+    iteration_sink: ?streaming.Sink = null,
     /// Optional callback invoked for each LLM response usage record.
     usage_record_callback: ?UsageRecordCallback = null,
     /// Context pointer passed to usage_record_callback.
@@ -2250,15 +2254,21 @@ pub const Agent = struct {
                 return final_text;
             }
 
-            // There are tool calls — print intermediary text.
-            // In tests, stdout is used by Zig's test runner protocol (`--listen`),
-            // so avoid writing arbitrary text that can corrupt the control channel.
-            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
-                var out_buf: [4096]u8 = undefined;
-                var bw = std.fs.File.stdout().writer(&out_buf);
-                const w = &bw.interface;
-                w.print("{s}", .{display_text}) catch {};
-                w.flush() catch {};
+            // There are tool calls — emit intermediary text.
+            if (display_text.len > 0 and parsed_calls.len > 0) {
+                // Emit as intermediate message through iteration sink (for channels).
+                if (self.iteration_sink) |sink| {
+                    sink.emitIntermediate(display_text);
+                }
+                // In tests, stdout is used by Zig's test runner protocol (`--listen`),
+                // so avoid writing arbitrary text that can corrupt the control channel.
+                if (!builtin.is_test and !is_streaming) {
+                    var out_buf: [4096]u8 = undefined;
+                    var bw = std.fs.File.stdout().writer(&out_buf);
+                    const w = &bw.interface;
+                    w.print("{s}", .{display_text}) catch {};
+                    w.flush() catch {};
+                }
             }
 
             // Record assistant message with tool calls in history.

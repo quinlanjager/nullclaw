@@ -199,7 +199,7 @@ pub const Channel = struct {
         if (self.vtable.sendEvent) |fn_send_event| {
             return fn_send_event(self.ptr, target, message, media, stage);
         }
-        if (stage == .final) return self.send(target, message, media);
+        if (stage == .final or stage == .intermediate) return self.send(target, message, media);
     }
 
     pub fn sendRich(self: Channel, target: []const u8, payload: OutboundPayload) !void {

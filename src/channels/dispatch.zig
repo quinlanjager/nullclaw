@@ -268,6 +268,7 @@ fn dispatchOutboundMessage(
             .final => {
                 if (try dispatchDraftFinal(allocator, channel, msg, draft_messages)) return;
             },
+            .intermediate => {}, // Bypass draft buffering, fall through to direct dispatch.
         }
     }
 
@@ -563,7 +564,7 @@ const MockChannel = struct {
         if (self.should_fail) return error.SendFailed;
         switch (stage) {
             .chunk => _ = self.chunk_count.fetchAdd(1, .monotonic),
-            .final => _ = self.sent_count.fetchAdd(1, .monotonic),
+            .intermediate, .final => _ = self.sent_count.fetchAdd(1, .monotonic),
         }
     }
     fn mockName(ctx: *anyopaque) []const u8 {

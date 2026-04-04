@@ -1371,6 +1371,9 @@ pub const MaxChannel = struct {
 
         switch (stage) {
             .chunk => try self.handleSendEventChunk(target, message),
+            .intermediate => {
+                if (message.len > 0) try self.handleSendEventFinal(target, message);
+            },
             .final => try self.handleSendEventFinal(target, message),
         }
     }

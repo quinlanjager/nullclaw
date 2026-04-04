@@ -161,6 +161,15 @@ pub fn makeOutboundChunk(
     return makeOutboundWithStage(allocator, channel, chat_id, content, .chunk);
 }
 
+pub fn makeOutboundIntermediate(
+    allocator: Allocator,
+    channel: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) Allocator.Error!OutboundMessage {
+    return makeOutboundWithStage(allocator, channel, chat_id, content, .intermediate);
+}
+
 fn makeOutboundWithStage(
     allocator: Allocator,
     channel: []const u8,
@@ -199,6 +208,16 @@ pub fn makeOutboundChunkWithAccount(
     content: []const u8,
 ) Allocator.Error!OutboundMessage {
     return makeOutboundWithAccountStage(allocator, channel, account_id, chat_id, content, .chunk);
+}
+
+pub fn makeOutboundIntermediateWithAccount(
+    allocator: Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) Allocator.Error!OutboundMessage {
+    return makeOutboundWithAccountStage(allocator, channel, account_id, chat_id, content, .intermediate);
 }
 
 fn makeOutboundWithAccountStage(

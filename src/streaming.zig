@@ -2,6 +2,7 @@ const providers = @import("providers/root.zig");
 
 pub const OutboundStage = enum {
     chunk,
+    intermediate,
     final,
 };
 
@@ -22,6 +23,14 @@ pub const Sink = struct {
         if (text.len == 0) return;
         self.emit(.{
             .stage = .chunk,
+            .text = text,
+        });
+    }
+
+    pub fn emitIntermediate(self: Sink, text: []const u8) void {
+        if (text.len == 0) return;
+        self.emit(.{
+            .stage = .intermediate,
             .text = text,
         });
     }
@@ -124,9 +133,9 @@ pub const TagFilter = struct {
 
     fn filterCallback(ctx: *anyopaque, event: Event) void {
         const self: *TagFilter = @ptrCast(@alignCast(ctx));
-        if (event.stage == .final) {
+        if (event.stage == .final or event.stage == .intermediate) {
             // Flush any pending buffer as-is (incomplete tag at end of stream).
-            self.flushBuf();
+            if (event.stage == .final) self.flushBuf();
             self.inner.emit(event);
             return;
         }

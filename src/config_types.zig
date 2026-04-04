@@ -389,6 +389,8 @@ pub const TelegramConfig = struct {
     require_mention: bool = false,
     /// Stream partial responses to users via sendMessageDraft before the final message.
     streaming: bool = true,
+    /// Send each agent iteration's text as a separate message (shows tool-call reasoning).
+    intermediate_messages: bool = false,
     /// Show task lifecycle on the triggering user message via Telegram reactions.
     status_reactions: bool = false,
     /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.

@@ -665,6 +665,7 @@ pub const TelegramChannel = struct {
     draft_id_counter: Atomic(u64) = Atomic(u64).init(1),
     draft_global_suppress_until_ms: i64 = 0,
     streaming_enabled: bool = true,
+    intermediate_messages_enabled: bool = false,
     status_reactions_enabled: bool = false,
     reaction_emojis: config_types.TelegramReactionEmojisConfig = .{},
     binding_commands_enabled: bool = true,
@@ -726,6 +727,7 @@ pub const TelegramChannel = struct {
         ch.interactive = cfg.interactive;
         ch.require_mention = cfg.require_mention;
         ch.streaming_enabled = cfg.streaming;
+        ch.intermediate_messages_enabled = cfg.intermediate_messages;
         ch.status_reactions_enabled = cfg.status_reactions;
         ch.reaction_emojis = cfg.reaction_emojis;
         ch.binding_commands_enabled = cfg.binding_commands_enabled;
@@ -3057,6 +3059,22 @@ pub const TelegramChannel = struct {
         stage: root.Channel.OutboundStage,
     ) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+
+        // Intermediate iteration messages are always dispatched (when enabled),
+        // regardless of streaming mode.
+        if (stage == .intermediate) {
+            if (self.intermediate_messages_enabled and message.len > 0) {
+                // Clear any pending draft so message ordering is correct.
+                {
+                    self.draft_mu.lock();
+                    defer self.draft_mu.unlock();
+                    telegram_draft_presenter.clearDraftForTarget(self.allocator, &self.draft_buffers, target);
+                }
+                try vtableSend(ptr, target, message, &.{});
+            }
+            return;
+        }
+
         if (!self.streaming_enabled) {
             if (stage == .final and message.len > 0) {
                 return vtableSend(ptr, target, message, &.{});
@@ -3102,6 +3120,7 @@ pub const TelegramChannel = struct {
                     try vtableSend(ptr, target, message, &.{});
                 }
             },
+            .intermediate => {}, // Handled above, before the streaming gate.
         }
     }
 

@@ -498,6 +498,7 @@ fn parseMetadataValue(obj: std.json.ObjectMap) !?std.json.Value {
 fn stageToSlice(stage: root.Channel.OutboundStage) []const u8 {
     return switch (stage) {
         .chunk => "chunk",
+        .intermediate => "intermediate",
         .final => "final",
     };
 }

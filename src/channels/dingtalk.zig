@@ -1303,6 +1303,11 @@ pub const DingTalkChannel = struct {
                     try self.sendMessage(trimmed_target, message, media);
                 }
             },
+            .intermediate => {
+                if (message.len > 0) {
+                    try self.sendMessage(trimmed_target, message, media);
+                }
+            },
         }
     }
 
