@@ -2092,6 +2092,11 @@ pub const Agent = struct {
             var free_parsed_calls = false;
             var free_parsed_text = false;
             var free_assistant_history = false;
+            // Original allocation metadata — needed because filterUnrecognizedCalls
+            // may compact parsed_calls into a sub-slice whose length no longer
+            // matches the original allocation.
+            var parsed_calls_alloc_ptr: ?[*]ParsedToolCall = null;
+            var parsed_calls_alloc_len: usize = 0;
 
             defer {
                 if (free_parsed_calls) {
@@ -2100,7 +2105,11 @@ pub const Agent = struct {
                         self.allocator.free(call.arguments_json);
                         if (call.tool_call_id) |id| self.allocator.free(id);
                     }
-                    self.allocator.free(parsed_calls);
+                    if (parsed_calls_alloc_ptr) |ptr| {
+                        self.allocator.free(ptr[0..parsed_calls_alloc_len]);
+                    } else {
+                        self.allocator.free(parsed_calls);
+                    }
                 }
                 if (free_parsed_text and parsed_text.len > 0) self.allocator.free(parsed_text);
                 if (free_assistant_history and assistant_history_content.len > 0) self.allocator.free(assistant_history_content);
@@ -2140,6 +2149,22 @@ pub const Agent = struct {
                 // For XML path, never preserve model-fabricated <tool_result> markup in history.
                 assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
                 free_assistant_history = true;
+            }
+
+            // Filter out tool calls whose names don't match any registered tool.
+            // Prevents upstream relay tool calls (e.g. from Meridian) from being
+            // executed and polluting conversation history with "Unknown tool" errors.
+            {
+                parsed_calls_alloc_ptr = parsed_calls.ptr;
+                parsed_calls_alloc_len = parsed_calls.len;
+                const original_count = parsed_calls.len;
+                parsed_calls = self.filterUnrecognizedCalls(parsed_calls);
+                if (parsed_calls.len < original_count) {
+                    log.info("relay filter: dropped {d}/{d} unrecognized tool call(s)", .{
+                        original_count - parsed_calls.len,
+                        original_count,
+                    });
+                }
             }
 
             // Determine display text.
@@ -2629,6 +2654,35 @@ pub const Agent = struct {
         return starts_with_ascii_ignore_case(key, "pref.tools.") or
             starts_with_ascii_ignore_case(key, "preference.tools.") or
             std.ascii.eqlIgnoreCase(key, "__bootstrap.prompt.TOOLS.md");
+    }
+
+    /// Filter out tool calls whose names don't match any registered tool.
+    /// Compacts the slice in-place, frees removed entries' heap strings,
+    /// and returns the compacted sub-slice.
+    fn filterUnrecognizedCalls(self: *const Agent, calls: []ParsedToolCall) []ParsedToolCall {
+        var write_idx: usize = 0;
+        for (calls) |call| {
+            const trimmed_name = std.mem.trim(u8, call.name, " \t\r\n");
+            var found = false;
+            for (self.tools) |t| {
+                if (std.ascii.eqlIgnoreCase(t.name(), trimmed_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                calls[write_idx] = call;
+                write_idx += 1;
+            } else {
+                if (self.log_tool_calls) {
+                    log.info("filtered unrecognized tool call: name={s}", .{call.name});
+                }
+                self.allocator.free(call.name);
+                self.allocator.free(call.arguments_json);
+                if (call.tool_call_id) |id| self.allocator.free(id);
+            }
+        }
+        return calls[0..write_idx];
     }
 
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
@@ -9227,4 +9281,159 @@ test "globMatch handles prefix wildcard" {
     try std.testing.expect(Agent.globMatch("*", "anything"));
     try std.testing.expect(Agent.globMatch("shell", "shell"));
     try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
+}
+
+// ── filterUnrecognizedCalls tests ──────────────────────────────────
+
+const TestToolShell = struct {
+    pub const tool_name = "shell";
+    pub const tool_description = "test";
+    pub const tool_params = "{}";
+    pub fn execute(_: *@This(), _: std.mem.Allocator, _: std.json.ObjectMap) !tools_mod.ToolResult {
+        return tools_mod.ToolResult.ok("");
+    }
+};
+
+const TestToolReadFile = struct {
+    pub const tool_name = "read_file";
+    pub const tool_description = "test";
+    pub const tool_params = "{}";
+    pub fn execute(_: *@This(), _: std.mem.Allocator, _: std.json.ObjectMap) !tools_mod.ToolResult {
+        return tools_mod.ToolResult.ok("");
+    }
+};
+
+fn makeTestAgentWithTools(allocator: std.mem.Allocator, tools: []const Tool) !Agent {
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const agent = try Agent.fromConfig(allocator, &cfg, undefined, tools, null, noop.observer());
+    return agent;
+}
+
+fn makeParsedCall(allocator: std.mem.Allocator, name: []const u8, args: []const u8) !ParsedToolCall {
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .arguments_json = try allocator.dupe(u8, args),
+        .tool_call_id = null,
+    };
+}
+
+test "filterUnrecognizedCalls removes unknown tools" {
+    const allocator = std.testing.allocator;
+
+    var shell_impl: TestToolShell = .{};
+    const shell_vtable = tools_mod.ToolVTable(TestToolShell);
+    var read_impl: TestToolReadFile = .{};
+    const read_vtable = tools_mod.ToolVTable(TestToolReadFile);
+    const tools: []const Tool = &.{
+        .{ .ptr = @ptrCast(&shell_impl), .vtable = &shell_vtable },
+        .{ .ptr = @ptrCast(&read_impl), .vtable = &read_vtable },
+    };
+
+    var agent = try makeTestAgentWithTools(allocator, tools);
+    defer agent.deinit();
+
+    var calls = try allocator.alloc(ParsedToolCall, 3);
+    calls[0] = try makeParsedCall(allocator, "shell", "{}");
+    calls[1] = try makeParsedCall(allocator, "mcp__opencode__read", "{}");
+    calls[2] = try makeParsedCall(allocator, "read_file", "{}");
+
+    const filtered = agent.filterUnrecognizedCalls(calls);
+    defer allocator.free(calls); // free original backing allocation
+
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    try std.testing.expectEqualStrings("shell", filtered[0].name);
+    try std.testing.expectEqualStrings("read_file", filtered[1].name);
+
+    // Clean up remaining entries' heap strings
+    for (filtered) |call| {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+}
+
+test "filterUnrecognizedCalls all unknown yields empty" {
+    const allocator = std.testing.allocator;
+
+    var shell_impl: TestToolShell = .{};
+    const shell_vtable = tools_mod.ToolVTable(TestToolShell);
+    const tools: []const Tool = &.{
+        .{ .ptr = @ptrCast(&shell_impl), .vtable = &shell_vtable },
+    };
+
+    var agent = try makeTestAgentWithTools(allocator, tools);
+    defer agent.deinit();
+
+    var calls = try allocator.alloc(ParsedToolCall, 2);
+    calls[0] = try makeParsedCall(allocator, "mcp__opencode__read", "{}");
+    calls[1] = try makeParsedCall(allocator, "mcp__opencode__bash", "{}");
+
+    const filtered = agent.filterUnrecognizedCalls(calls);
+    defer allocator.free(calls);
+
+    try std.testing.expectEqual(@as(usize, 0), filtered.len);
+}
+
+test "filterUnrecognizedCalls all recognized yields unchanged" {
+    const allocator = std.testing.allocator;
+
+    var shell_impl: TestToolShell = .{};
+    const shell_vtable = tools_mod.ToolVTable(TestToolShell);
+    var read_impl: TestToolReadFile = .{};
+    const read_vtable = tools_mod.ToolVTable(TestToolReadFile);
+    const tools: []const Tool = &.{
+        .{ .ptr = @ptrCast(&shell_impl), .vtable = &shell_vtable },
+        .{ .ptr = @ptrCast(&read_impl), .vtable = &read_vtable },
+    };
+
+    var agent = try makeTestAgentWithTools(allocator, tools);
+    defer agent.deinit();
+
+    var calls = try allocator.alloc(ParsedToolCall, 2);
+    calls[0] = try makeParsedCall(allocator, "shell", "{}");
+    calls[1] = try makeParsedCall(allocator, "read_file", "{}");
+
+    const filtered = agent.filterUnrecognizedCalls(calls);
+    defer allocator.free(calls);
+
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    try std.testing.expectEqualStrings("shell", filtered[0].name);
+    try std.testing.expectEqualStrings("read_file", filtered[1].name);
+
+    for (filtered) |call| {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+}
+
+test "filterUnrecognizedCalls case insensitive match" {
+    const allocator = std.testing.allocator;
+
+    var shell_impl: TestToolShell = .{};
+    const shell_vtable = tools_mod.ToolVTable(TestToolShell);
+    const tools: []const Tool = &.{
+        .{ .ptr = @ptrCast(&shell_impl), .vtable = &shell_vtable },
+    };
+
+    var agent = try makeTestAgentWithTools(allocator, tools);
+    defer agent.deinit();
+
+    var calls = try allocator.alloc(ParsedToolCall, 1);
+    calls[0] = try makeParsedCall(allocator, "Shell", "{}");
+
+    const filtered = agent.filterUnrecognizedCalls(calls);
+    defer allocator.free(calls);
+
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("Shell", filtered[0].name);
+
+    for (filtered) |call| {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
 }
