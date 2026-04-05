@@ -350,7 +350,7 @@ pub const MaxChannel = struct {
     webhook_secret: ?[]const u8 = null,
     interactive: config_types.MaxInteractiveConfig = .{},
     require_mention: bool = false,
-    streaming_enabled: bool = true,
+    streaming_mode: config_types.StreamingMode = .full,
 
     bot_username: ?[]const u8 = null,
     bot_user_id: ?[]const u8 = null,
@@ -379,7 +379,7 @@ pub const MaxChannel = struct {
             .webhook_secret = cfg.webhook_secret,
             .interactive = cfg.interactive,
             .require_mention = cfg.require_mention,
-            .streaming_enabled = cfg.streaming,
+            .streaming_mode = if (!cfg.streaming) .off else cfg.streaming_mode,
         };
     }
 
@@ -1362,7 +1362,8 @@ pub const MaxChannel = struct {
         stage: root.Channel.OutboundStage,
     ) anyerror!void {
         const self: *MaxChannel = @ptrCast(@alignCast(ptr));
-        if (!self.streaming_enabled) {
+        if (self.streaming_mode != .full) {
+            // off and progressive: no draft updates, just send on .final.
             if (stage == .final and message.len > 0) {
                 return vtableSend(ptr, target, message, &.{});
             }
@@ -1402,7 +1403,7 @@ pub const MaxChannel = struct {
 
     fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
         const self: *MaxChannel = @ptrCast(@alignCast(ptr));
-        return self.streaming_enabled;
+        return self.streaming_mode != .off;
     }
 
     // ── Streaming sink (for processMessageStreaming) ──────────────
@@ -1411,6 +1412,19 @@ pub const MaxChannel = struct {
         max_ptr: *MaxChannel,
         chat_id: []const u8,
         filter: streaming.TagFilter = undefined,
+        progressive: streaming.ProgressiveSink = undefined,
+        progressive_active: bool = false,
+
+        pub fn progressiveSentCount(self: *const StreamCtx) u32 {
+            if (!self.progressive_active) return 0;
+            return @constCast(&self.progressive).sent_count;
+        }
+
+        pub fn deinit(self: *StreamCtx) void {
+            if (self.progressive_active) {
+                self.progressive.deinit();
+            }
+        }
     };
 
     fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
@@ -1419,11 +1433,29 @@ pub const MaxChannel = struct {
         ctx.max_ptr.handleSendEventChunk(ctx.chat_id, event.text) catch {};
     }
 
+    fn progressiveSendCallback(ctx_ptr: *anyopaque, text: []const u8) void {
+        const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+        vtableSend(@ptrCast(ctx.max_ptr), ctx.chat_id, text, &.{}) catch {};
+    }
+
     /// Build a streaming sink backed by the given context.
-    /// Returns null if streaming is disabled. Caller owns the lifetime of `ctx`.
+    /// Returns null if streaming is off. Caller owns the lifetime of `ctx`
+    /// and must call `ctx.deinit()` when done.
     /// Chunks are filtered through a TagFilter to strip tool_call markup.
     pub fn makeSink(self: *MaxChannel, ctx: *StreamCtx) ?streaming.Sink {
-        if (!self.streaming_enabled) return null;
+        if (self.streaming_mode == .off) return null;
+
+        if (self.streaming_mode == .progressive) {
+            ctx.progressive = .{
+                .allocator = self.allocator,
+                .inner_send = progressiveSendCallback,
+                .inner_ctx = @ptrCast(ctx),
+            };
+            ctx.progressive_active = true;
+            ctx.filter = streaming.TagFilter.init(ctx.progressive.toSink());
+            return ctx.filter.sink();
+        }
+
         const raw = streaming.Sink{
             .callback = streamCallback,
             .ctx = @ptrCast(ctx),
@@ -1988,7 +2020,7 @@ test "vtableSendEvent chunk assigns unique entry per chat" {
 
 test "vtableSendEvent disabled streaming is noop" {
     var ch = testChannel();
-    ch.streaming_enabled = false;
+    ch.streaming_mode = .off;
     defer ch.deinitDraftBuffers();
 
     try ch.channel().sendEvent("12345", "data", &.{}, .chunk);
@@ -2090,7 +2122,7 @@ test "initFromConfig sets all fields" {
     try std.testing.expectEqualStrings("my-token", ch.bot_token);
     try std.testing.expectEqualStrings("prod", ch.account_id);
     try std.testing.expectEqualStrings("http://proxy:8080", ch.proxy.?);
-    try std.testing.expect(!ch.streaming_enabled);
+    try std.testing.expect(ch.streaming_mode == .off);
     try std.testing.expect(ch.require_mention);
 }
 

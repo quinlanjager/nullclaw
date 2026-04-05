@@ -258,6 +258,55 @@ pub const TagFilter = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// ProgressiveSink – accumulates chunks and sends complete messages on .final.
+// ---------------------------------------------------------------------------
+
+/// A sink wrapper that buffers `.chunk` events and delivers the accumulated
+/// text as a single complete message when `.final` arrives.  This gives
+/// channels a way to show every LLM response without token-by-token drafts.
+///
+/// The caller provides an `inner_send` callback that performs the actual
+/// channel delivery (e.g. `channel.send()`).  The callback receives the
+/// full accumulated text and an opaque context pointer.
+pub const ProgressiveSink = struct {
+    allocator: std.mem.Allocator,
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    inner_send: *const fn (ctx: *anyopaque, text: []const u8) void,
+    inner_ctx: *anyopaque,
+    sent_count: u32 = 0,
+
+    pub fn deinit(self: *ProgressiveSink) void {
+        self.buffer.deinit(self.allocator);
+    }
+
+    /// Return a Sink whose callback routes through this progressive adapter.
+    pub fn toSink(self: *ProgressiveSink) Sink {
+        return .{
+            .callback = progressiveCallback,
+            .ctx = @ptrCast(self),
+        };
+    }
+
+    fn progressiveCallback(ctx_ptr: *anyopaque, event: Event) void {
+        const self: *ProgressiveSink = @ptrCast(@alignCast(ctx_ptr));
+        switch (event.stage) {
+            .chunk => {
+                if (event.text.len > 0) {
+                    self.buffer.appendSlice(self.allocator, event.text) catch {};
+                }
+            },
+            .final => {
+                if (self.buffer.items.len > 0) {
+                    self.inner_send(self.inner_ctx, self.buffer.items);
+                    self.sent_count += 1;
+                    self.buffer.clearRetainingCapacity();
+                }
+            },
+        }
+    }
+};
+
 const std = @import("std");
 
 // ---------------------------------------------------------------------------
@@ -446,4 +495,78 @@ test "TagFilter strips section wrapper with mixed pipe-delimited close tag" {
     s.emitFinal();
     var buf: [96]u8 = undefined;
     try std.testing.expectEqualStrings("AB", col.joined(&buf));
+}
+
+// ---------------------------------------------------------------------------
+// ProgressiveSink tests
+// ---------------------------------------------------------------------------
+
+fn collectProgressiveSends(comptime max: usize) type {
+    return struct {
+        messages: [max][]const u8 = undefined,
+        count: usize = 0,
+
+        fn sendCallback(ctx: *anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.count < max) {
+                self.messages[self.count] = text;
+                self.count += 1;
+            }
+        }
+    };
+}
+
+test "ProgressiveSink accumulates chunks and sends on final" {
+    var col = collectProgressiveSends(8){};
+    var prog = ProgressiveSink{
+        .allocator = std.testing.allocator,
+        .inner_send = collectProgressiveSends(8).sendCallback,
+        .inner_ctx = @ptrCast(&col),
+    };
+    defer prog.deinit();
+
+    const s = prog.toSink();
+    s.emitChunk("Hello ");
+    s.emitChunk("world!");
+    try std.testing.expectEqual(@as(usize, 0), col.count);
+    s.emitFinal();
+    try std.testing.expectEqual(@as(usize, 1), col.count);
+    try std.testing.expectEqual(@as(u32, 1), prog.sent_count);
+}
+
+test "ProgressiveSink handles multiple iterations" {
+    var col = collectProgressiveSends(8){};
+    var prog = ProgressiveSink{
+        .allocator = std.testing.allocator,
+        .inner_send = collectProgressiveSends(8).sendCallback,
+        .inner_ctx = @ptrCast(&col),
+    };
+    defer prog.deinit();
+
+    const s = prog.toSink();
+    // Iteration 1
+    s.emitChunk("First ");
+    s.emitChunk("response");
+    s.emitFinal();
+    // Iteration 2
+    s.emitChunk("Second response");
+    s.emitFinal();
+
+    try std.testing.expectEqual(@as(usize, 2), col.count);
+    try std.testing.expectEqual(@as(u32, 2), prog.sent_count);
+}
+
+test "ProgressiveSink skips empty final" {
+    var col = collectProgressiveSends(8){};
+    var prog = ProgressiveSink{
+        .allocator = std.testing.allocator,
+        .inner_send = collectProgressiveSends(8).sendCallback,
+        .inner_ctx = @ptrCast(&col),
+    };
+    defer prog.deinit();
+
+    const s = prog.toSink();
+    s.emitFinal();
+    try std.testing.expectEqual(@as(usize, 0), col.count);
+    try std.testing.expectEqual(@as(u32, 0), prog.sent_count);
 }

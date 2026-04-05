@@ -342,6 +342,17 @@ pub const TelegramReactionEmojisConfig = struct {
     failed: []const u8 = "💔",
 };
 
+/// Controls how streaming output is delivered to users.
+/// - `off`: no streaming; only the final response is sent.
+/// - `progressive`: provider streams internally, but each complete LLM response
+///   is sent as a whole message (no token-by-token drafts).
+/// - `full`: token-by-token draft previews are sent as the response is generated.
+pub const StreamingMode = enum {
+    off,
+    progressive,
+    full,
+};
+
 pub const TelegramCommandsMenuMode = enum {
     off,
     flat,
@@ -372,6 +383,8 @@ pub const MaxConfig = struct {
     interactive: MaxInteractiveConfig = .{},
     require_mention: bool = false,
     streaming: bool = true,
+    /// When streaming is true, controls presentation: "full" sends drafts, "progressive" sends complete messages only.
+    streaming_mode: StreamingMode = .full,
 };
 
 pub const TelegramConfig = struct {
@@ -389,6 +402,8 @@ pub const TelegramConfig = struct {
     require_mention: bool = false,
     /// Stream partial responses to users via sendMessageDraft before the final message.
     streaming: bool = true,
+    /// When streaming is true, controls presentation: "full" sends drafts, "progressive" sends complete messages only.
+    streaming_mode: StreamingMode = .full,
     /// Show task lifecycle on the triggering user message via Telegram reactions.
     status_reactions: bool = false,
     /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.

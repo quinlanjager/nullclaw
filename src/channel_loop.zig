@@ -839,6 +839,7 @@ fn processTelegramMessage(
         .draft_id = draft_turn_id,
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
+    defer stream_ctx.deinit();
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
@@ -854,6 +855,13 @@ fn processTelegramMessage(
 
     if (shouldSuppressGroupReply(is_group, reply)) {
         log.info("Smart reply: skipping non-essential message", .{});
+        tg_ptr.setTaskReaction(sender, message_id, .done);
+        return;
+    }
+
+    // In progressive mode, intermediate and final responses were already
+    // sent by the ProgressiveSink.  Skip the duplicate final send.
+    if (stream_ctx.progressiveSentCount() > 0) {
         tg_ptr.setTaskReaction(sender, message_id, .done);
         return;
     }
@@ -2055,6 +2063,7 @@ pub fn runMaxLoop(
                 .chat_id = reply_target,
             };
             const sink = mx_ptr.makeSink(&stream_ctx);
+            defer stream_ctx.deinit();
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
                 logAgentProcessingError(allocator, "Max agent error", err);
@@ -2070,6 +2079,9 @@ pub fn runMaxLoop(
                 log.info("Smart reply: skipping non-essential message", .{});
                 continue;
             }
+
+            // In progressive mode, responses were already sent.
+            if (stream_ctx.progressiveSentCount() > 0) continue;
 
             mx_ptr.sendMessage(reply_target, reply) catch |err| {
                 log.warn("Max send error: {}", .{err});

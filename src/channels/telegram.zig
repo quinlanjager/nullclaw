@@ -664,7 +664,7 @@ pub const TelegramChannel = struct {
     draft_target_suppress_until_ms: std.StringHashMapUnmanaged(i64) = .empty,
     draft_id_counter: Atomic(u64) = Atomic(u64).init(1),
     draft_global_suppress_until_ms: i64 = 0,
-    streaming_enabled: bool = true,
+    streaming_mode: config_types.StreamingMode = .full,
     status_reactions_enabled: bool = false,
     reaction_emojis: config_types.TelegramReactionEmojisConfig = .{},
     binding_commands_enabled: bool = true,
@@ -725,7 +725,7 @@ pub const TelegramChannel = struct {
         ch.proxy = cfg.proxy;
         ch.interactive = cfg.interactive;
         ch.require_mention = cfg.require_mention;
-        ch.streaming_enabled = cfg.streaming;
+        ch.streaming_mode = if (!cfg.streaming) .off else cfg.streaming_mode;
         ch.status_reactions_enabled = cfg.status_reactions;
         ch.reaction_emojis = cfg.reaction_emojis;
         ch.binding_commands_enabled = cfg.binding_commands_enabled;
@@ -2848,7 +2848,7 @@ pub const TelegramChannel = struct {
     }
 
     pub fn beginDraftTurn(self: *TelegramChannel, target: []const u8) !u64 {
-        if (!self.streaming_enabled or target.len == 0) return 0;
+        if (self.streaming_mode == .off or target.len == 0) return 0;
 
         const now_ms = std.time.milliTimestamp();
         self.draft_mu.lock();
@@ -2869,7 +2869,7 @@ pub const TelegramChannel = struct {
     }
 
     fn sendDraftChunkForTurn(self: *TelegramChannel, target: []const u8, draft_id: u64, message: []const u8) !void {
-        if (!self.streaming_enabled or draft_id == 0 or message.len == 0) return;
+        if (self.streaming_mode != .full or draft_id == 0 or message.len == 0) return;
 
         var pending_flush: ?telegram_draft_presenter.DraftFlush = null;
         defer if (pending_flush) |*flush| flush.deinit(self.allocator);
@@ -2957,7 +2957,7 @@ pub const TelegramChannel = struct {
     }
 
     fn sendDraftHeartbeat(self: *TelegramChannel, chat_id: []const u8) void {
-        if (builtin.is_test or !self.streaming_enabled or chat_id.len == 0) return;
+        if (builtin.is_test or self.streaming_mode != .full or chat_id.len == 0) return;
 
         const now_ms = std.time.milliTimestamp();
         var pending_flush: ?telegram_draft_presenter.DraftFlush = null;
@@ -3057,7 +3057,8 @@ pub const TelegramChannel = struct {
         stage: root.Channel.OutboundStage,
     ) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
-        if (!self.streaming_enabled) {
+        if (self.streaming_mode != .full) {
+            // off and progressive: no draft updates, just send on .final.
             if (stage == .final and message.len > 0) {
                 return vtableSend(ptr, target, message, &.{});
             }
@@ -3144,7 +3145,7 @@ pub const TelegramChannel = struct {
 
     fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
-        return self.streaming_enabled;
+        return self.streaming_mode != .off;
     }
 
     pub const vtable = root.Channel.VTable{
@@ -3172,6 +3173,19 @@ pub const TelegramChannel = struct {
         chat_id: []const u8,
         draft_id: u64 = 0,
         filter: streaming.TagFilter = undefined,
+        progressive: streaming.ProgressiveSink = undefined,
+        progressive_active: bool = false,
+
+        pub fn progressiveSentCount(self: *const StreamCtx) u32 {
+            if (!self.progressive_active) return 0;
+            return @constCast(&self.progressive).sent_count;
+        }
+
+        pub fn deinit(self: *StreamCtx) void {
+            if (self.progressive_active) {
+                self.progressive.deinit();
+            }
+        }
     };
 
     fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
@@ -3180,11 +3194,31 @@ pub const TelegramChannel = struct {
         ctx.tg_ptr.sendDraftChunkForTurn(ctx.chat_id, ctx.draft_id, event.text) catch {};
     }
 
+    fn progressiveSendCallback(ctx_ptr: *anyopaque, text: []const u8) void {
+        const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+        vtableSend(@ptrCast(ctx.tg_ptr), ctx.chat_id, text, &.{}) catch {};
+    }
+
     /// Build a streaming sink backed by the given context.
-    /// Returns null if streaming is disabled. Caller owns the lifetime of `ctx`.
+    /// Returns null if streaming is off. Caller owns the lifetime of `ctx`
+    /// and must call `ctx.deinit()` when done.
     /// Chunks are filtered through a TagFilter to strip tool_call markup.
     pub fn makeSink(self: *TelegramChannel, ctx: *StreamCtx) ?streaming.Sink {
-        if (!self.streaming_enabled) return null;
+        if (self.streaming_mode == .off) return null;
+
+        if (self.streaming_mode == .progressive) {
+            // Progressive: accumulate chunks, send complete messages on .final.
+            ctx.progressive = .{
+                .allocator = self.allocator,
+                .inner_send = progressiveSendCallback,
+                .inner_ctx = @ptrCast(ctx),
+            };
+            ctx.progressive_active = true;
+            ctx.filter = streaming.TagFilter.init(ctx.progressive.toSink());
+            return ctx.filter.sink();
+        }
+
+        // Full streaming: forward chunks to draft presenter.
         const raw = streaming.Sink{
             .callback = streamCallback,
             .ctx = @ptrCast(ctx),
@@ -5336,7 +5370,7 @@ test "vtableSendEvent target draft cooldown does not affect other chats" {
 test "vtableSendEvent disabled streaming is noop" {
     const allocator = std.testing.allocator;
     var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
-    ch.streaming_enabled = false;
+    ch.streaming_mode = .off;
     defer ch.deinitDraftBuffers();
 
     try ch.channel().sendEvent("12345", "data", &.{}, .chunk);
