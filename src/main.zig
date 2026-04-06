@@ -3284,7 +3284,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     tg.reply_in_private = telegram_config.reply_in_private;
     tg.interactive = telegram_config.interactive;
     tg.require_mention = telegram_config.require_mention;
-    tg.streaming_enabled = telegram_config.streaming;
+    tg.streaming_mode = if (!telegram_config.streaming) .off else telegram_config.streaming_mode;
     tg.status_reactions_enabled = telegram_config.status_reactions;
     tg.reaction_emojis = telegram_config.reaction_emojis;
     tg.binding_commands_enabled = telegram_config.binding_commands_enabled;
